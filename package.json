@@ -10,10 +10,11 @@
     "start": "tsx src/server.ts",
     "fetch": "tsx src/cli.ts",
     "tunnel": "npx --yes cloudflared tunnel --url http://127.0.0.1:8791",
-    "postinstall": "playwright install chromium"
+    "postinstall": "node scripts/install-browsers.mjs",
+    "build": "node scripts/install-browsers.mjs"
   },
   "dependencies": {
-    "playwright": "^1.55.0",
+    "playwright": "1.62.1",
     "tsx": "^4.19.0"
   },
   "devDependencies": {

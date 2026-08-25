@@ -1,5 +1,7 @@
+import "./playwright-env.js";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { networkInterfaces } from "node:os";
+import { chromium } from "playwright";
 import { fetchMoxfieldDeckViaBrowser, closeBrowser } from "./fetch-deck.js";
 
 const PORT = Number(process.env.PORT ?? 8791);
@@ -155,6 +157,7 @@ server.timeout = 0;
 server.listen(PORT, HOST, () => {
   const urls = advertisedUrls().join("\n  ");
   console.log(`moxfield-fetcher listening on ${HOST}:${PORT}`);
+  console.log(`Chromium executable: ${chromium.executablePath()}`);
   console.log(`reachable at:\n  ${urls}`);
   console.log("GET /health");
   console.log("GET /v1/decks/:publicId");

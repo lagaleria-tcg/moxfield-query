@@ -1,3 +1,4 @@
+import "./playwright-env.js";
 import { fetchMoxfieldDeckViaBrowser, closeBrowser } from "./fetch-deck.js";
 
 const publicId = process.argv[2]?.trim();

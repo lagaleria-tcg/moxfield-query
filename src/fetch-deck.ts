@@ -1,3 +1,4 @@
+import "./playwright-env.js";
 import { chromium, type Browser, type Page } from "playwright";
 
 const DECK_API_PATH = /api2\.moxfield\.com\/v\d+\/decks\/all\//;
@@ -14,10 +15,21 @@ let browserPromise: Promise<Browser> | null = null;
 
 async function getBrowser(): Promise<Browser> {
   if (!browserPromise) {
-    browserPromise = chromium.launch({
-      headless: true,
-      args: ["--disable-blink-features=AutomationControlled"],
-    });
+    browserPromise = chromium
+      .launch({
+        headless: true,
+        chromiumSandbox: false,
+        args: [
+          "--disable-blink-features=AutomationControlled",
+          "--no-sandbox",
+          "--disable-setuid-sandbox",
+          "--disable-dev-shm-usage",
+        ],
+      })
+      .catch((err: unknown) => {
+        browserPromise = null;
+        throw err;
+      });
   }
   return browserPromise;
 }
