@@ -1,0 +1,23 @@
+{
+  "name": "moxfield-fetcher",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "tsx src/server.ts",
+    "fetch": "tsx src/cli.ts",
+    "tunnel": "npx --yes cloudflared tunnel --url http://127.0.0.1:8791",
+    "postinstall": "playwright install chromium"
+  },
+  "dependencies": {
+    "playwright": "^1.55.0",
+    "tsx": "^4.19.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}
