@@ -2,7 +2,9 @@ import "./playwright-env.js";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { networkInterfaces } from "node:os";
 import { chromium } from "playwright";
+import { getFeaturedExpansion } from "./featured-expansion.js";
 import { fetchMoxfieldDeckViaBrowser, closeBrowser } from "./fetch-deck.js";
+import { fetchWizardsHeroAssets } from "./wizards-hero.js";
 
 const PORT = Number(process.env.PORT ?? 8791);
 const HOST = process.env.HOST ?? "0.0.0.0";
@@ -71,6 +73,70 @@ function enqueue<T>(fn: () => Promise<T>): Promise<T> {
     () => undefined,
   );
   return next;
+}
+
+async function handleFeaturedExpansion(
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<void> {
+  if (!authorize(req)) {
+    sendJson(res, 401, { error: "Unauthorized" });
+    return;
+  }
+
+  const started = Date.now();
+  try {
+    const expansion = await getFeaturedExpansion();
+    if (!expansion) {
+      sendJson(res, 502, { error: "Failed to resolve featured expansion" });
+      return;
+    }
+    console.log("featured-expansion", {
+      code: expansion.code,
+      usesWizardsBackground: expansion.usesWizardsBackground,
+      ms: Date.now() - started,
+    });
+    sendJson(res, 200, expansion);
+  } catch (e) {
+    console.error("featured-expansion failed", {
+      ms: Date.now() - started,
+      message: e instanceof Error ? e.message : String(e),
+    });
+    sendJson(res, 502, {
+      error: "Failed to resolve featured expansion",
+      detail: e instanceof Error ? e.message : String(e),
+    });
+  }
+}
+
+async function handleWizardsHero(
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<void> {
+  if (!authorize(req)) {
+    sendJson(res, 401, { error: "Unauthorized" });
+    return;
+  }
+
+  const started = Date.now();
+  try {
+    const assets = await fetchWizardsHeroAssets();
+    console.log("wizards-hero", {
+      hasBanner: Boolean(assets.bannerUrl),
+      hasLogo: Boolean(assets.logoUrl),
+      ms: Date.now() - started,
+    });
+    sendJson(res, 200, assets);
+  } catch (e) {
+    console.error("wizards-hero failed", {
+      ms: Date.now() - started,
+      message: e instanceof Error ? e.message : String(e),
+    });
+    sendJson(res, 502, {
+      error: "Failed to scrape Wizards hero",
+      detail: e instanceof Error ? e.message : String(e),
+    });
+  }
 }
 
 async function handleFetchDeck(
@@ -147,6 +213,16 @@ const server = createServer((req, res) => {
     return;
   }
 
+  if (method === "GET" && url.pathname === "/v1/featured-expansion") {
+    void handleFeaturedExpansion(req, res);
+    return;
+  }
+
+  if (method === "GET" && url.pathname === "/v1/wizards-hero") {
+    void handleWizardsHero(req, res);
+    return;
+  }
+
   sendJson(res, 404, { error: "Not found" });
 });
 
@@ -162,6 +238,8 @@ server.listen(PORT, HOST, () => {
   console.log("GET /health");
   console.log("GET /v1/decks/:publicId");
   console.log("GET /v1/decks?publicId=<id>");
+  console.log("GET /v1/featured-expansion");
+  console.log("GET /v1/wizards-hero");
   console.log(
     `secret ${SHARED_SECRET ? "set" : "UNSET — open on this host"}`,
   );
