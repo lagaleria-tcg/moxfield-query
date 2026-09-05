@@ -1,35 +1,50 @@
 import "./playwright-env.js";
-import { fetchMoxfieldDeckViaBrowser, closeBrowser } from "./fetch-deck.js";
+import { fetchMoxfieldViaBrowser, closeBrowser } from "./fetch-deck.js";
+import { parseMoxfieldTarget } from "./moxfield-resource.js";
 
-const publicId = process.argv[2]?.trim();
-if (!publicId) {
+const raw = process.argv[2]?.trim();
+const target = raw ? parseMoxfieldTarget(raw) : null;
+if (!target) {
   console.error(
-    "Usage: npm run fetch -- <publicId>\nExample: npm run fetch -- 0lVXTNWWzU6LLsdT02x6Kg",
+    "Usage: npm run fetch -- <publicId|url>\n" +
+      "Example: npm run fetch -- 0lVXTNWWzU6LLsdT02x6Kg\n" +
+      "         npm run fetch -- https://www.moxfield.com/collection/J4FAbt_MtEG8pj0wk3jZpg",
   );
   process.exit(1);
 }
 
 try {
-  const { deck, via } = await fetchMoxfieldDeckViaBrowser(publicId);
-  const d = deck && typeof deck === "object" ? (deck as Record<string, unknown>) : null;
+  const { data, via, kind, publicId } = await fetchMoxfieldViaBrowser(target);
+  const rec = data && typeof data === "object" ? (data as Record<string, unknown>) : null;
   const boards =
-    d?.boards && typeof d.boards === "object" && !Array.isArray(d.boards)
-      ? (d.boards as Record<string, { cards?: Record<string, unknown> }>)
+    rec?.boards && typeof rec.boards === "object" && !Array.isArray(rec.boards)
+      ? (rec.boards as Record<string, { cards?: Record<string, unknown> }>)
       : null;
   const mainboardCards = boards?.mainboard?.cards;
-  const summary = d
+  const rows = Array.isArray(rec?.data) ? rec.data : null;
+  const user =
+    rec?.user && typeof rec.user === "object"
+      ? (rec.user as { displayName?: string; userName?: string })
+      : null;
+  const summary = rec
     ? {
-        name: typeof d.name === "string" ? d.name : null,
-        publicId: typeof d.publicId === "string" ? d.publicId : null,
-        mainboardCount:
-          mainboardCards && typeof mainboardCards === "object"
+        kind,
+        publicId: typeof rec.publicId === "string" ? rec.publicId : publicId,
+        name:
+          typeof rec.name === "string"
+            ? rec.name
+            : user?.displayName ?? user?.userName ?? null,
+        itemCount: rows
+          ? rows.length
+          : mainboardCards && typeof mainboardCards === "object"
             ? Object.keys(mainboardCards).length
-            : d.mainboard && typeof d.mainboard === "object"
-              ? Object.keys(d.mainboard as object).length
-              : 0,
+            : rec.mainboard && typeof rec.mainboard === "object"
+              ? Object.keys(rec.mainboard as object).length
+              : typeof rec.totalResults === "number"
+                ? rec.totalResults
+                : 0,
       }
     : null;
-  // Compact CLI output (full payload is huge).
   console.log(JSON.stringify({ via, summary }, null, 2));
 } catch (e) {
   console.error(e instanceof Error ? e.message : e);
