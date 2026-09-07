@@ -1,6 +1,7 @@
 import "./playwright-env.js";
 import {
   chromium,
+  type APIRequestContext,
   type Browser,
   type BrowserContext,
   type Page,
@@ -18,22 +19,27 @@ import {
 const NAV_TIMEOUT_MS = 45_000;
 const RESPONSE_TIMEOUT_MS = 30_000;
 const PAGE_FETCH_TIMEOUT_MS = 20_000;
-const PAGE_CONCURRENCY = 6;
+const PAGE_CONCURRENCY = 4;
 const BROWSER_UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
+const API_HEADERS = {
+  Accept: "application/json, text/plain, */*",
+  Referer: "https://www.moxfield.com/",
+  Origin: "https://www.moxfield.com",
+};
 
 export type MoxfieldFetchVia =
   | "network-intercept"
   | "cookie-replay"
+  | "context-request"
   | "browser-request";
 
 export type MoxfieldBrowserFetchResult = {
   kind: MoxfieldKind;
   publicId: string;
   data: unknown;
-  /** How the JSON was obtained. */
   via: MoxfieldFetchVia;
-  /** Present for decks so existing clients keep working. */
   deck?: unknown;
 };
 
@@ -54,6 +60,8 @@ async function getBrowser(): Promise<Browser> {
           "--no-sandbox",
           "--disable-setuid-sandbox",
           "--disable-dev-shm-usage",
+          "--disable-gpu",
+          "--disable-extensions",
         ],
       })
       .catch((err: unknown) => {
@@ -74,10 +82,9 @@ export async function closeBrowser(): Promise<void> {
 }
 
 /**
- * Playwright is only used to pass Cloudflare (real Chrome + cookies).
- * Paginated resources then replay api2 from Node with those cookies, in
- * parallel. If Cloudflare still blocks Node, pages are fetched inside the
- * browser in concurrent batches.
+ * Playwright solves Cloudflare. Remaining collection pages should come from
+ * Node or Playwright's APIRequestContext so we do not serialize thousands of
+ * cards through page.evaluate (that OOMs small Render instances).
  */
 export async function fetchMoxfieldViaBrowser(
   target: MoxfieldTarget,
@@ -131,7 +138,7 @@ export async function fetchMoxfieldViaBrowser(
       if (intercepted) {
         return toResult(target, intercepted, "network-intercept");
       }
-      const data = await fetchFirstFromCandidates(page, null, target, signal);
+      const data = await fetchFirstFromCandidates(page, context, target, signal);
       return toResult(target, data.body, data.via);
     }
 
@@ -142,8 +149,7 @@ export async function fetchMoxfieldViaBrowser(
       return toResult(target, intercepted, "network-intercept");
     }
 
-    const cookies = await cookieHeader(context);
-    const first = await fetchFirstFromCandidates(page, cookies, target, signal);
+    const first = await fetchFirstFromCandidates(page, context, target, signal);
     const firstMeta = isPaginatedPayload(first.body)
       ? {
           totalPages: first.body.totalPages,
@@ -160,7 +166,7 @@ export async function fetchMoxfieldViaBrowser(
     });
     const data = await expandPages(
       page,
-      cookies,
+      context,
       first.body,
       first.templateUrl,
       first.via,
@@ -212,23 +218,24 @@ function waitForResourceApiResponse(page: Page, kind: MoxfieldKind): Promise<unk
 
 async function fetchFirstFromCandidates(
   page: Page,
-  cookies: string | null,
+  context: BrowserContext,
   target: MoxfieldTarget,
   signal?: AbortSignal,
 ): Promise<{ body: unknown; templateUrl: string; via: MoxfieldFetchVia }> {
   throwIfAborted(signal);
+  const cookies = await cookieHeader(context);
   for (const url of apiCandidateUrls(target)) {
-    if (cookies) {
-      const fromNode = await fetchJsonFromNode(url, cookies, signal);
-      if (fromNode.ok) {
-        return { body: fromNode.body, templateUrl: url, via: "cookie-replay" };
-      }
+    const result = await fetchJson(page, context, url, cookies, signal);
+    if (result.ok) {
+      return { body: result.body, templateUrl: url, via: result.via };
     }
-    throwIfAborted(signal);
-    const fromBrowser = await fetchJsonInBrowser(page, url);
-    if (fromBrowser.ok) {
-      return { body: fromBrowser.body, templateUrl: url, via: "browser-request" };
-    }
+    console.log("moxfield fetch", {
+      stage: "candidate-miss",
+      url,
+      via: result.via,
+      status: result.status,
+      error: result.error ?? null,
+    });
   }
 
   throw new Error(
@@ -238,7 +245,7 @@ async function fetchFirstFromCandidates(
 
 async function expandPages(
   page: Page,
-  cookies: string | null,
+  context: BrowserContext,
   firstPage: unknown,
   templateUrl: string,
   via: MoxfieldFetchVia,
@@ -256,7 +263,7 @@ async function expandPages(
     totalPages: firstPage.totalPages,
     totalResults: firstPage.totalResults ?? null,
   });
-  const rest = await fetchPages(page, cookies, urls, via, signal);
+  const rest = await fetchPages(page, context, urls, via, signal);
   const pages = [firstPage, ...rest];
   const data = pages.flatMap((p) => (isPaginatedPayload(p) ? p.data : []));
   const expected =
@@ -280,7 +287,7 @@ async function expandPages(
 
 async function fetchPages(
   page: Page,
-  cookies: string | null,
+  context: BrowserContext,
   urls: string[],
   via: MoxfieldFetchVia,
   signal?: AbortSignal,
@@ -289,67 +296,137 @@ async function fetchPages(
     return [];
   }
 
-  if (via === "cookie-replay" && cookies) {
-    const fromNode = await mapPool(urls, PAGE_CONCURRENCY, async (url) => {
+  const cookies = await cookieHeader(context);
+  const preferEvaluate = via === "browser-request";
+  const out: unknown[] = [];
+
+  if (!preferEvaluate) {
+    const fromFast = await mapPool(urls, PAGE_CONCURRENCY, async (url, index) => {
       throwIfAborted(signal);
-      return fetchJsonFromNode(url, cookies, signal);
+      const result = await fetchJson(page, context, url, cookies, signal, {
+        allowEvaluate: false,
+      });
+      if ((index + 1) % 8 === 0 || index + 1 === urls.length) {
+        console.log("moxfield fetch", {
+          stage: "pages-progress",
+          done: index + 1,
+          remaining: urls.length,
+        });
+      }
+      return result;
     });
-    if (fromNode.every((r) => r.ok)) {
-      return fromNode.map((r) => r.body);
+    if (fromFast.every((r) => r.ok)) {
+      return fromFast.map((r) => r.body);
     }
+    console.log("moxfield fetch", {
+      stage: "pages-fallback-evaluate",
+      failed: fromFast.filter((r) => !r.ok).length,
+    });
   }
 
-  const fromBrowser = await fetchJsonBatchInBrowser(page, urls);
-  if (!fromBrowser.every((r) => r.ok)) {
-    const failed = fromBrowser.find((r) => !r.ok);
-    throw new Error(
-      `Moxfield page fetch failed (status=${failed && !failed.ok ? failed.status : "?"})`,
-    );
-  }
-  return fromBrowser.map((r) => r.body);
-}
-
-async function fetchJsonBatchInBrowser(
-  page: Page,
-  urls: string[],
-): Promise<JsonFetch[]> {
-  const batches = chunk(urls, PAGE_CONCURRENCY);
-  const out: JsonFetch[] = [];
-  for (const batch of batches) {
-    const part = await page.evaluate(async (apiUrls) => {
-      const headers = {
-        Accept: "application/json, text/plain, */*",
-        Referer: "https://www.moxfield.com/",
-      };
-      return Promise.all(
-        apiUrls.map(async (apiUrl) => {
-          try {
-            const res = await fetch(apiUrl, { headers, credentials: "include" });
-            if (!res.ok) {
-              return { ok: false as const, status: res.status };
-            }
-            return { ok: true as const, body: await res.json() };
-          } catch (e) {
-            return {
-              ok: false as const,
-              status: 0,
-              error: e instanceof Error ? e.message : String(e),
-            };
-          }
-        }),
+  for (const [index, url] of urls.entries()) {
+    throwIfAborted(signal);
+    const result = await fetchJsonInBrowser(page, url);
+    if (!result.ok) {
+      throw new Error(
+        `Moxfield page fetch failed (status=${result.status} page=${index + 2})`,
       );
-    }, batch);
-    out.push(...part);
-    if (part.some((r) => !r.ok)) {
-      break;
+    }
+    out.push(result.body);
+    if ((index + 1) % 4 === 0 || index + 1 === urls.length) {
+      console.log("moxfield fetch", {
+        stage: "pages-progress",
+        via: "browser-request",
+        done: index + 1,
+        remaining: urls.length,
+      });
     }
   }
   return out;
 }
 
+async function fetchJson(
+  page: Page,
+  context: BrowserContext,
+  url: string,
+  cookies: string,
+  signal?: AbortSignal,
+  options?: { allowEvaluate?: boolean },
+): Promise<JsonFetch & { via: MoxfieldFetchVia }> {
+  const allowEvaluate = options?.allowEvaluate ?? true;
+
+  if (cookies) {
+    const fromNode = await fetchJsonFromNode(url, cookies, signal);
+    if (fromNode.ok) {
+      return { ...fromNode, via: "cookie-replay" };
+    }
+  }
+
+  const fromContext = await fetchJsonFromContext(context.request, url);
+  if (fromContext.ok) {
+    return { ...fromContext, via: "context-request" };
+  }
+
+  if (!allowEvaluate) {
+    return { ...fromContext, via: "context-request" };
+  }
+
+  const fromBrowser = await fetchJsonInBrowser(page, url);
+  return { ...fromBrowser, via: "browser-request" };
+}
+
+async function fetchJsonFromContext(
+  request: APIRequestContext,
+  url: string,
+): Promise<JsonFetch> {
+  try {
+    const res = await request.get(url, {
+      timeout: PAGE_FETCH_TIMEOUT_MS,
+      headers: API_HEADERS,
+    });
+    if (!res.ok()) {
+      return { ok: false, status: res.status() };
+    }
+    const type = res.headers()["content-type"] ?? "";
+    if (!type.includes("json")) {
+      return { ok: false, status: res.status(), error: "not-json" };
+    }
+    return { ok: true, body: await res.json() };
+  } catch (e) {
+    if (isAbortError(e)) {
+      throw e instanceof Error ? e : new Error("Moxfield fetch aborted");
+    }
+    return {
+      ok: false,
+      status: 0,
+      error: e instanceof Error ? e.message : String(e),
+    };
+  }
+}
+
 async function fetchJsonInBrowser(page: Page, url: string): Promise<JsonFetch> {
-  const [result] = await fetchJsonBatchInBrowser(page, [url]);
-  return result ?? { ok: false, status: 0, error: "empty batch" };
+  return page.evaluate(async (apiUrl) => {
+    try {
+      const res = await fetch(apiUrl, {
+        headers: {
+          Accept: "application/json, text/plain, */*",
+          Referer: "https://www.moxfield.com/",
+          Origin: "https://www.moxfield.com",
+        },
+        credentials: "include",
+      });
+      if (!res.ok) {
+        return { ok: false as const, status: res.status };
+      }
+      return { ok: true as const, body: await res.json() };
+    } catch (e) {
+      return {
+        ok: false as const,
+        status: 0,
+        error: e instanceof Error ? e.message : String(e),
+      };
+    }
+  }, url);
 }
 
 async function fetchJsonFromNode(
@@ -361,8 +438,7 @@ async function fetchJsonFromNode(
     const res = await fetch(url, {
       signal: fetchSignal(signal),
       headers: {
-        Accept: "application/json, text/plain, */*",
-        Referer: "https://www.moxfield.com/",
+        ...API_HEADERS,
         "User-Agent": BROWSER_UA,
         "Accept-Language": "en-US,en;q=0.9",
         Cookie: cookies,
@@ -400,14 +476,17 @@ function isAbortError(error: unknown): boolean {
 }
 
 async function cookieHeader(context: BrowserContext): Promise<string> {
-  const cookies = await context.cookies();
+  const cookies = await context.cookies([
+    "https://www.moxfield.com/",
+    "https://api2.moxfield.com/",
+  ]);
   return cookies.map((c) => `${c.name}=${c.value}`).join("; ");
 }
 
 async function mapPool<T, R>(
   items: T[],
   concurrency: number,
-  fn: (item: T) => Promise<R>,
+  fn: (item: T, index: number) => Promise<R>,
 ): Promise<R[]> {
   const results: R[] = new Array(items.length);
   let next = 0;
@@ -415,7 +494,7 @@ async function mapPool<T, R>(
     while (next < items.length) {
       const index = next;
       next += 1;
-      results[index] = await fn(items[index] as T);
+      results[index] = await fn(items[index] as T, index);
     }
   }
   const workers = Array.from(
@@ -443,12 +522,4 @@ function throwIfAborted(signal?: AbortSignal): void {
     err.name = "AbortError";
     throw err;
   }
-}
-
-function chunk<T>(items: T[], size: number): T[][] {
-  const out: T[][] = [];
-  for (let i = 0; i < items.length; i += size) {
-    out.push(items.slice(i, i + size));
-  }
-  return out;
 }
