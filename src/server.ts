@@ -24,13 +24,73 @@ function sendJson(
   res: ServerResponse,
   status: number,
   body: Record<string, unknown>,
-): void {
+): number {
   const payload = JSON.stringify(body);
+  const bytes = Buffer.byteLength(payload);
   res.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
-    "Content-Length": Buffer.byteLength(payload),
+    "Content-Length": bytes,
   });
   res.end(payload);
+  return bytes;
+}
+
+function summarizeMoxfieldData(data: unknown): Record<string, unknown> {
+  if (!data || typeof data !== "object") {
+    return { dataType: data === null ? "null" : typeof data };
+  }
+
+  const rec = data as Record<string, unknown>;
+  const rows = Array.isArray(rec.data) ? rec.data : null;
+  const user =
+    rec.user && typeof rec.user === "object"
+      ? (rec.user as { displayName?: string; userName?: string })
+      : null;
+  const boards =
+    rec.boards && typeof rec.boards === "object" && !Array.isArray(rec.boards)
+      ? (rec.boards as Record<string, { cards?: Record<string, unknown> }>)
+      : null;
+  const mainboard = boards?.mainboard?.cards;
+  const sample = (rows ?? []).slice(0, 5).map((row) => {
+    if (!row || typeof row !== "object") {
+      return row;
+    }
+    const item = row as Record<string, unknown>;
+    const card =
+      item.card && typeof item.card === "object"
+        ? (item.card as { name?: string; set?: string })
+        : null;
+    return {
+      quantity: item.quantity ?? null,
+      name: card?.name ?? (typeof item.name === "string" ? item.name : null),
+      set: card?.set ?? null,
+    };
+  });
+
+  const items = rows
+    ? rows.length
+    : mainboard && typeof mainboard === "object"
+      ? Object.keys(mainboard).length
+      : rec.mainboard && typeof rec.mainboard === "object"
+        ? Object.keys(rec.mainboard as object).length
+        : undefined;
+  const totalResults =
+    typeof rec.totalResults === "number" ? rec.totalResults : undefined;
+
+  return {
+    name:
+      typeof rec.name === "string"
+        ? rec.name
+        : user?.displayName ?? user?.userName ?? null,
+    keys: Object.keys(rec).slice(0, 20),
+    items,
+    totalResults,
+    complete:
+      typeof items === "number" && typeof totalResults === "number"
+        ? items >= totalResults
+        : undefined,
+    sample,
+  };
 }
 
 function authorize(req: IncomingMessage): boolean {
@@ -159,6 +219,7 @@ async function handleFetchMoxfield(
 ): Promise<void> {
   if (!authorize(req)) {
     sendJson(res, 401, { error: "Unauthorized" });
+    console.log("GET moxfield response", { status: 401, error: "Unauthorized" });
     return;
   }
 
@@ -167,35 +228,53 @@ async function handleFetchMoxfield(
       error:
         "Moxfield url or publicId required (e.g. /collection/{id}, /decks/{id}, /binders/{id}, /lists/{id})",
     });
+    console.log("GET moxfield response", {
+      status: 400,
+      error: "Moxfield url or publicId required",
+      path: req.url ?? "",
+    });
     return;
   }
+
+  console.log("GET moxfield", {
+    kind: target.kind,
+    publicId: target.publicId,
+    path: req.url ?? "",
+  });
 
   const started = Date.now();
   try {
     const fetched = await enqueue(() => fetchMoxfieldViaBrowser(target));
-    console.log("fetched", {
-      kind: fetched.kind,
-      publicId: fetched.publicId,
-      via: fetched.via,
-      ms: Date.now() - started,
-    });
-    sendJson(res, 200, {
+    const body = {
       kind: fetched.kind,
       publicId: fetched.publicId,
       via: fetched.via,
       data: fetched.data,
       ...(fetched.kind === "deck" ? { deck: fetched.data } : {}),
+    };
+    const bytes = sendJson(res, 200, body);
+    console.log("GET moxfield response", {
+      status: 200,
+      kind: fetched.kind,
+      publicId: fetched.publicId,
+      via: fetched.via,
+      bytes,
+      ms: Date.now() - started,
+      ...summarizeMoxfieldData(fetched.data),
     });
   } catch (e) {
-    console.error("moxfield-fetcher failed", {
+    const detail = e instanceof Error ? e.message : String(e);
+    const bytes = sendJson(res, 502, {
+      error: `Failed to fetch Moxfield ${target.kind} via browser`,
+      detail,
+    });
+    console.error("GET moxfield response", {
+      status: 502,
       kind: target.kind,
       publicId: target.publicId,
+      bytes,
       ms: Date.now() - started,
-      message: e instanceof Error ? e.message : String(e),
-    });
-    sendJson(res, 502, {
-      error: `Failed to fetch Moxfield ${target.kind} via browser`,
-      detail: e instanceof Error ? e.message : String(e),
+      error: detail,
     });
   }
 }

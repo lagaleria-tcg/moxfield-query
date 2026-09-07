@@ -169,6 +169,14 @@ export function nextPageUrl(currentUrl: string, pageNumber: number): string {
   return url.toString();
 }
 
+export function pageUrls(templateUrl: string, fromPage: number, toPage: number): string[] {
+  const urls: string[] = [];
+  for (let n = fromPage; n <= toPage; n += 1) {
+    urls.push(nextPageUrl(templateUrl, n));
+  }
+  return urls;
+}
+
 function collectionQuery(pageNumber: number): string {
   const params = new URLSearchParams({
     pageNumber: String(pageNumber),
