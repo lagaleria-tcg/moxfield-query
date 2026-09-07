@@ -27,12 +27,26 @@ function sendJson(
 ): number {
   const payload = JSON.stringify(body);
   const bytes = Buffer.byteLength(payload);
+  if (res.writableEnded || res.destroyed) {
+    return bytes;
+  }
   res.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
     "Content-Length": bytes,
   });
   res.end(payload);
   return bytes;
+}
+
+function isAbortError(error: unknown): boolean {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+  const err = error as { name?: string; message?: string };
+  return (
+    err.name === "AbortError" ||
+    (typeof err.message === "string" && /aborted/i.test(err.message))
+  );
 }
 
 function summarizeMoxfieldData(data: unknown): Record<string, unknown> {
@@ -243,8 +257,44 @@ async function handleFetchMoxfield(
   });
 
   const started = Date.now();
+  const ac = new AbortController();
+  let finished = false;
+  const onClientGone = () => {
+    if (finished || ac.signal.aborted || res.writableEnded) {
+      return;
+    }
+    console.log("GET moxfield aborted", {
+      kind: target.kind,
+      publicId: target.publicId,
+      ms: Date.now() - started,
+      reqDestroyed: req.destroyed,
+      resDestroyed: res.destroyed,
+    });
+    ac.abort();
+  };
+  req.once("close", onClientGone);
+  res.once("close", onClientGone);
+
   try {
-    const fetched = await enqueue(() => fetchMoxfieldViaBrowser(target));
+    const fetched = await enqueue(() =>
+      fetchMoxfieldViaBrowser(target, ac.signal),
+    );
+    if (ac.signal.aborted) {
+      console.log("GET moxfield response", {
+        status: "aborted",
+        kind: fetched.kind,
+        publicId: fetched.publicId,
+        via: fetched.via,
+        ms: Date.now() - started,
+        ...summarizeMoxfieldData(fetched.data),
+      });
+      return;
+    }
+    console.log("GET moxfield serializing", {
+      kind: fetched.kind,
+      publicId: fetched.publicId,
+      ms: Date.now() - started,
+    });
     const body = {
       kind: fetched.kind,
       publicId: fetched.publicId,
@@ -264,6 +314,16 @@ async function handleFetchMoxfield(
     });
   } catch (e) {
     const detail = e instanceof Error ? e.message : String(e);
+    if (ac.signal.aborted || isAbortError(e)) {
+      console.log("GET moxfield response", {
+        status: "aborted",
+        kind: target.kind,
+        publicId: target.publicId,
+        ms: Date.now() - started,
+        error: detail,
+      });
+      return;
+    }
     const bytes = sendJson(res, 502, {
       error: `Failed to fetch Moxfield ${target.kind} via browser`,
       detail,
@@ -276,6 +336,10 @@ async function handleFetchMoxfield(
       ms: Date.now() - started,
       error: detail,
     });
+  } finally {
+    finished = true;
+    req.off("close", onClientGone);
+    res.off("close", onClientGone);
   }
 }
 

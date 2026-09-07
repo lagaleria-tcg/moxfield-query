@@ -17,6 +17,7 @@ import {
 
 const NAV_TIMEOUT_MS = 45_000;
 const RESPONSE_TIMEOUT_MS = 30_000;
+const PAGE_FETCH_TIMEOUT_MS = 20_000;
 const PAGE_CONCURRENCY = 6;
 const BROWSER_UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
@@ -80,7 +81,10 @@ export async function closeBrowser(): Promise<void> {
  */
 export async function fetchMoxfieldViaBrowser(
   target: MoxfieldTarget,
+  signal?: AbortSignal,
 ): Promise<MoxfieldBrowserFetchResult> {
+  throwIfAborted(signal);
+  const started = Date.now();
   const browser = await getBrowser();
   const context = await browser.newContext({
     locale: "en-US",
@@ -90,13 +94,24 @@ export async function fetchMoxfieldViaBrowser(
     },
   });
 
+  const onAbort = () => {
+    void context.close();
+  };
+  signal?.addEventListener("abort", onAbort, { once: true });
+
   const page = await context.newPage();
   try {
+    console.log("moxfield fetch", {
+      stage: "goto",
+      kind: target.kind,
+      publicId: target.publicId,
+    });
     const intercept = waitForResourceApiResponse(page, target.kind);
     await page.goto(moxfieldPageUrl(target), {
       waitUntil: "domcontentloaded",
       timeout: NAV_TIMEOUT_MS,
     });
+    throwIfAborted(signal);
 
     let intercepted: unknown = null;
     try {
@@ -104,12 +119,19 @@ export async function fetchMoxfieldViaBrowser(
     } catch {
       intercepted = null;
     }
+    console.log("moxfield fetch", {
+      stage: "handshake",
+      kind: target.kind,
+      publicId: target.publicId,
+      intercepted: Boolean(intercepted),
+      ms: Date.now() - started,
+    });
 
     if (target.kind === "deck") {
       if (intercepted) {
         return toResult(target, intercepted, "network-intercept");
       }
-      const data = await fetchFirstFromCandidates(page, null, target);
+      const data = await fetchFirstFromCandidates(page, null, target, signal);
       return toResult(target, data.body, data.via);
     }
 
@@ -121,11 +143,33 @@ export async function fetchMoxfieldViaBrowser(
     }
 
     const cookies = await cookieHeader(context);
-    const first = await fetchFirstFromCandidates(page, cookies, target);
-    const data = await expandPages(page, cookies, first.body, first.templateUrl, first.via);
+    const first = await fetchFirstFromCandidates(page, cookies, target, signal);
+    const firstMeta = isPaginatedPayload(first.body)
+      ? {
+          totalPages: first.body.totalPages,
+          totalResults: first.body.totalResults,
+        }
+      : {};
+    console.log("moxfield fetch", {
+      stage: "first-page",
+      kind: target.kind,
+      publicId: target.publicId,
+      via: first.via,
+      ms: Date.now() - started,
+      ...firstMeta,
+    });
+    const data = await expandPages(
+      page,
+      cookies,
+      first.body,
+      first.templateUrl,
+      first.via,
+      signal,
+    );
     return toResult(target, data, first.via);
   } finally {
-    await context.close();
+    signal?.removeEventListener("abort", onAbort);
+    await context.close().catch(() => undefined);
   }
 }
 
@@ -170,14 +214,17 @@ async function fetchFirstFromCandidates(
   page: Page,
   cookies: string | null,
   target: MoxfieldTarget,
+  signal?: AbortSignal,
 ): Promise<{ body: unknown; templateUrl: string; via: MoxfieldFetchVia }> {
+  throwIfAborted(signal);
   for (const url of apiCandidateUrls(target)) {
     if (cookies) {
-      const fromNode = await fetchJsonFromNode(url, cookies);
+      const fromNode = await fetchJsonFromNode(url, cookies, signal);
       if (fromNode.ok) {
         return { body: fromNode.body, templateUrl: url, via: "cookie-replay" };
       }
     }
+    throwIfAborted(signal);
     const fromBrowser = await fetchJsonInBrowser(page, url);
     if (fromBrowser.ok) {
       return { body: fromBrowser.body, templateUrl: url, via: "browser-request" };
@@ -195,13 +242,21 @@ async function expandPages(
   firstPage: unknown,
   templateUrl: string,
   via: MoxfieldFetchVia,
+  signal?: AbortSignal,
 ): Promise<unknown> {
   if (!isPaginatedPayload(firstPage) || firstPage.totalPages <= 1) {
     return firstPage;
   }
 
   const urls = pageUrls(templateUrl, 2, firstPage.totalPages);
-  const rest = await fetchPages(page, cookies, urls, via);
+  console.log("moxfield fetch", {
+    stage: "pages",
+    via,
+    remaining: urls.length,
+    totalPages: firstPage.totalPages,
+    totalResults: firstPage.totalResults ?? null,
+  });
+  const rest = await fetchPages(page, cookies, urls, via, signal);
   const pages = [firstPage, ...rest];
   const data = pages.flatMap((p) => (isPaginatedPayload(p) ? p.data : []));
   const expected =
@@ -228,15 +283,17 @@ async function fetchPages(
   cookies: string | null,
   urls: string[],
   via: MoxfieldFetchVia,
+  signal?: AbortSignal,
 ): Promise<unknown[]> {
   if (urls.length === 0) {
     return [];
   }
 
   if (via === "cookie-replay" && cookies) {
-    const fromNode = await mapPool(urls, PAGE_CONCURRENCY, (url) =>
-      fetchJsonFromNode(url, cookies),
-    );
+    const fromNode = await mapPool(urls, PAGE_CONCURRENCY, async (url) => {
+      throwIfAborted(signal);
+      return fetchJsonFromNode(url, cookies, signal);
+    });
     if (fromNode.every((r) => r.ok)) {
       return fromNode.map((r) => r.body);
     }
@@ -295,9 +352,14 @@ async function fetchJsonInBrowser(page: Page, url: string): Promise<JsonFetch> {
   return result ?? { ok: false, status: 0, error: "empty batch" };
 }
 
-async function fetchJsonFromNode(url: string, cookies: string): Promise<JsonFetch> {
+async function fetchJsonFromNode(
+  url: string,
+  cookies: string,
+  signal?: AbortSignal,
+): Promise<JsonFetch> {
   try {
     const res = await fetch(url, {
+      signal: fetchSignal(signal),
       headers: {
         Accept: "application/json, text/plain, */*",
         Referer: "https://www.moxfield.com/",
@@ -315,12 +377,26 @@ async function fetchJsonFromNode(url: string, cookies: string): Promise<JsonFetc
     }
     return { ok: true, body: await res.json() };
   } catch (e) {
+    if (isAbortError(e)) {
+      throw e instanceof Error ? e : new Error("Moxfield fetch aborted");
+    }
     return {
       ok: false,
       status: 0,
       error: e instanceof Error ? e.message : String(e),
     };
   }
+}
+
+function isAbortError(error: unknown): boolean {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+  const err = error as { name?: string; message?: string };
+  return (
+    err.name === "AbortError" ||
+    (typeof err.message === "string" && /aborted/i.test(err.message))
+  );
 }
 
 async function cookieHeader(context: BrowserContext): Promise<string> {
@@ -348,6 +424,25 @@ async function mapPool<T, R>(
   );
   await Promise.all(workers);
   return results;
+}
+
+function fetchSignal(signal?: AbortSignal): AbortSignal {
+  const timeout = AbortSignal.timeout(PAGE_FETCH_TIMEOUT_MS);
+  if (!signal) {
+    return timeout;
+  }
+  if (typeof AbortSignal.any === "function") {
+    return AbortSignal.any([signal, timeout]);
+  }
+  return signal;
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    const err = new Error("Moxfield fetch aborted");
+    err.name = "AbortError";
+    throw err;
+  }
 }
 
 function chunk<T>(items: T[], size: number): T[][] {
